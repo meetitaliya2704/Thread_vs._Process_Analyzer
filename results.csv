@@ -1,0 +1,3 @@
+mode,array_size,time_ms,cpu_usage
+thread,1000000,3.8218,523.32
+process,1000000,5.3344,0.00
