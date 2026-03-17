@@ -25,7 +25,16 @@ typedef struct {
 } ThreadData;
 
 // ─────────────────────────────────────────
-// THREAD WORKER — sums its chunk
+// CONTEXT SWITCH structure
+// ─────────────────────────────────────────
+typedef struct {
+    long voluntary;
+    long nonvoluntary;
+    long total;
+} CtxSwitch;
+
+// ─────────────────────────────────────────
+// THREAD WORKER
 // ─────────────────────────────────────────
 void *thread_sum(void *arg) {
     ThreadData *d = (ThreadData *)arg;
@@ -36,19 +45,21 @@ void *thread_sum(void *arg) {
 }
 
 // ─────────────────────────────────────────
-// RUN THREADS — splits array across 4 threads
+// RUN THREADS
 // ─────────────────────────────────────────
 long long run_threads(long long *array) {
-    pthread_t   threads[NUM_THREADS];
-    ThreadData  data[NUM_THREADS];
+    pthread_t  threads[NUM_THREADS];
+    ThreadData data[NUM_THREADS];
     int chunk = ARRAY_SIZE / NUM_THREADS;
 
     for (int i = 0; i < NUM_THREADS; i++) {
         data[i].array  = array;
         data[i].start  = i * chunk;
-        data[i].end    = (i == NUM_THREADS-1) ? ARRAY_SIZE : (i+1)*chunk;
+        data[i].end    = (i == NUM_THREADS-1)
+                         ? ARRAY_SIZE : (i+1)*chunk;
         data[i].result = 0;
-        pthread_create(&threads[i], NULL, thread_sum, &data[i]);
+        pthread_create(&threads[i], NULL,
+                       thread_sum, &data[i]);
     }
 
     long long total = 0;
@@ -60,30 +71,24 @@ long long run_threads(long long *array) {
 }
 
 // ─────────────────────────────────────────
-// RUN PROCESSES — forks 4 child processes
+// RUN PROCESSES
 // ─────────────────────────────────────────
 long long run_processes(long long *array) {
     int pipes[NUM_PROCS][2];
     int chunk = ARRAY_SIZE / NUM_PROCS;
 
-    // Create pipes
     for (int i = 0; i < NUM_PROCS; i++)
         pipe(pipes[i]);
 
-    // Fork children
     for (int i = 0; i < NUM_PROCS; i++) {
         pid_t pid = fork();
-
         if (pid == 0) {
-            // Child — sum its chunk
             int start     = i * chunk;
-            int end       = (i == NUM_PROCS-1) ? ARRAY_SIZE : (i+1)*chunk;
+            int end       = (i == NUM_PROCS-1)
+                            ? ARRAY_SIZE : (i+1)*chunk;
             long long sum = 0;
-
             for (int j = start; j < end; j++)
                 sum += array[j];
-
-            // Send result to parent
             close(pipes[i][0]);
             write(pipes[i][1], &sum, sizeof(long long));
             close(pipes[i][1]);
@@ -91,7 +96,6 @@ long long run_processes(long long *array) {
         }
     }
 
-    // Parent — collect results
     long long total = 0;
     for (int i = 0; i < NUM_PROCS; i++) {
         long long result = 0;
@@ -100,10 +104,8 @@ long long run_processes(long long *array) {
         close(pipes[i][0]);
         total += result;
     }
-
     for (int i = 0; i < NUM_PROCS; i++)
         wait(NULL);
-
     return total;
 }
 
@@ -117,18 +119,16 @@ double get_time_ms() {
 }
 
 // ─────────────────────────────────────────
-// GET CPU TICKS from /proc/self/stat
+// GET CPU TICKS
 // ─────────────────────────────────────────
 long get_cpu_ticks() {
     FILE *f = fopen("/proc/self/stat", "r");
     if (!f) return 0;
-
     int pid; char comm[256]; char state;
     int ppid, pgrp, session, tty, tpgid;
     unsigned flags;
     long minflt, cminflt, majflt, cmajflt;
     long utime, stime;
-
     fscanf(f, "%d %s %c %d %d %d %d %d %u "
               "%ld %ld %ld %ld %ld %ld",
            &pid, comm, &state,
@@ -144,22 +144,58 @@ long get_cpu_ticks() {
 // ─────────────────────────────────────────
 // CALCULATE CPU USAGE %
 // ─────────────────────────────────────────
-double get_cpu_usage(long ticks_before, long ticks_after, double elapsed_ms) {
-    long   ticks_used   = ticks_after - ticks_before;
-    long   ticks_per_sec = sysconf(_SC_CLK_TCK);
-    double cpu_ms       = (ticks_used * 1000.0) / ticks_per_sec;
+double get_cpu_usage(long before, long after,
+                     double elapsed_ms) {
+    long   ticks      = after - before;
+    long   tps        = sysconf(_SC_CLK_TCK);
+    double cpu_ms     = (ticks * 1000.0) / tps;
     if (elapsed_ms <= 0) return 0.0;
     return (cpu_ms / elapsed_ms) * 100.0;
 }
 
 // ─────────────────────────────────────────
+// READ CONTEXT SWITCHES
+// from /proc/self/status
+// ─────────────────────────────────────────
+void read_ctx_switches(CtxSwitch *ctx) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) {
+        ctx->voluntary    = 0;
+        ctx->nonvoluntary = 0;
+        ctx->total        = 0;
+        return;
+    }
+    char line[256];
+    ctx->voluntary    = 0;
+    ctx->nonvoluntary = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line,
+            "voluntary_ctxt_switches:", 24) == 0)
+            sscanf(line,
+                "voluntary_ctxt_switches: %ld",
+                &ctx->voluntary);
+        if (strncmp(line,
+            "nonvoluntary_ctxt_switches:", 27) == 0)
+            sscanf(line,
+                "nonvoluntary_ctxt_switches: %ld",
+                &ctx->nonvoluntary);
+    }
+    fclose(f);
+    ctx->total = ctx->voluntary + ctx->nonvoluntary;
+}
+
+// ─────────────────────────────────────────
 // SAVE TO CSV
 // ─────────────────────────────────────────
-void save_csv(char *mode, double time_ms, double cpu) {
+void save_csv(char *mode, double time_ms, double cpu,
+              long vol, long nonvol, long total_ctx) {
     FILE *f = fopen(CSV_FILE, "a");
     if (!f) return;
-    fprintf(f, "%s,%d,%.4f,%.2f\n",
-            mode, ARRAY_SIZE, time_ms, cpu);
+    fprintf(f, "%s,%d,%.4f,%.2f,%ld,%ld,%ld\n",
+            mode, ARRAY_SIZE,
+            time_ms, cpu,
+            vol, nonvol, total_ctx);
     fclose(f);
 }
 
@@ -169,10 +205,11 @@ void save_csv(char *mode, double time_ms, double cpu) {
 int main() {
 
     printf("\n");
-    printf("╔══════════════════════════════════╗\n");
-    printf("║  Thread vs Process Analyzer      ║\n");
-    printf("║  Array Size: 1,000,000 elements  ║\n");
-    printf("╚══════════════════════════════════╝\n\n");
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║   Thread vs Process Analyzer         ║\n");
+    printf("║   Array Size : 1,000,000 elements    ║\n");
+    printf("║   Metrics    : Time, CPU, Ctx Switch ║\n");
+    printf("╚══════════════════════════════════════╝\n\n");
 
     // ── Allocate and fill array ──
     long long *array = malloc(ARRAY_SIZE * sizeof(long long));
@@ -182,18 +219,20 @@ int main() {
     }
     for (int i = 0; i < ARRAY_SIZE; i++)
         array[i] = i + 1;
-
-    printf("✓ Array filled with 1 to 1,000,000\n\n");
+    printf("✓ Array filled: 1 to 1,000,000\n\n");
 
     // ── Init CSV ──
     FILE *f = fopen(CSV_FILE, "w");
     if (f) {
-        fprintf(f, "mode,array_size,time_ms,cpu_usage\n");
+        fprintf(f, "mode,array_size,time_ms,cpu_usage,"
+                   "vol_switches,nonvol_switches,"
+                   "total_switches\n");
         fclose(f);
     }
 
-    double t_start, t_end, elapsed;
-    long   cpu_before, cpu_after;
+    double    t_start, t_end;
+    long      cpu_before, cpu_after;
+    CtxSwitch ctx_before, ctx_after;
     long long result;
 
     // ════════════════════════════════
@@ -201,61 +240,93 @@ int main() {
     // ════════════════════════════════
     printf("Running Thread test...\n");
     cpu_before = get_cpu_ticks();
+    read_ctx_switches(&ctx_before);
     t_start    = get_time_ms();
 
     result     = run_threads(array);
 
     t_end      = get_time_ms();
     cpu_after  = get_cpu_ticks();
+    read_ctx_switches(&ctx_after);
 
-    double thread_time = t_end - t_start;
-    double thread_cpu  = get_cpu_usage(cpu_before, cpu_after, thread_time);
+    double thread_time     = t_end - t_start;
+    double thread_cpu      = get_cpu_usage(
+                                cpu_before, cpu_after,
+                                thread_time);
+    long thread_vol        = ctx_after.voluntary
+                           - ctx_before.voluntary;
+    long thread_nonvol     = ctx_after.nonvoluntary
+                           - ctx_before.nonvoluntary;
+    long thread_ctx_total  = ctx_after.total
+                           - ctx_before.total;
 
     printf("✓ Thread done!\n\n");
-    save_csv("thread", thread_time, thread_cpu);
+    save_csv("thread", thread_time, thread_cpu,
+             thread_vol, thread_nonvol,
+             thread_ctx_total);
 
     // ════════════════════════════════
     // TEST 2: PROCESSES
     // ════════════════════════════════
-
-    // Refill array (threads may have modified it)
     for (int i = 0; i < ARRAY_SIZE; i++)
         array[i] = i + 1;
 
     printf("Running Process test...\n");
     cpu_before = get_cpu_ticks();
+    read_ctx_switches(&ctx_before);
     t_start    = get_time_ms();
 
     result     = run_processes(array);
 
     t_end      = get_time_ms();
     cpu_after  = get_cpu_ticks();
+    read_ctx_switches(&ctx_after);
 
-    double process_time = t_end - t_start;
-    double process_cpu  = get_cpu_usage(cpu_before, cpu_after, process_time);
+    double process_time     = t_end - t_start;
+    double process_cpu      = get_cpu_usage(
+                                 cpu_before, cpu_after,
+                                 process_time);
+    long process_vol        = ctx_after.voluntary
+                            - ctx_before.voluntary;
+    long process_nonvol     = ctx_after.nonvoluntary
+                            - ctx_before.nonvoluntary;
+    long process_ctx_total  = ctx_after.total
+                            - ctx_before.total;
 
     printf("✓ Process done!\n\n");
-    save_csv("process", process_time, process_cpu);
+    save_csv("process", process_time, process_cpu,
+             process_vol, process_nonvol,
+             process_ctx_total);
 
     // ════════════════════════════════
     // SUMMARY TABLE
     // ════════════════════════════════
-    printf("╔══════════════════════════════════════════════╗\n");
-    printf("║              SUMMARY TABLE                   ║\n");
-    printf("╠══════════════════════════════════════════════╣\n");
-    printf("║  %-10s  %-12s  %-12s          ║\n",
-           "Mode", "Time (ms)", "CPU (%)");
-    printf("╠══════════════════════════════════════════════╣\n");
-    printf("║  %-10s  %-12.4f  %-12.2f          ║\n",
-           "Thread", thread_time, thread_cpu);
-    printf("║  %-10s  %-12.4f  %-12.2f          ║\n",
-           "Process", process_time, process_cpu);
-    printf("╠══════════════════════════════════════════════╣\n");
+    double speedup    = process_time / thread_time;
+    long   ctx_ratio  = (thread_ctx_total > 0)
+                        ? process_ctx_total / thread_ctx_total
+                        : 0;
 
-    // Speedup
-    double speedup = process_time / thread_time;
-    printf("║  Speedup: Thread is %.2fx faster             ║\n", speedup);
-    printf("╚══════════════════════════════════════════════╝\n\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║                    SUMMARY TABLE                         ║\n");
+    printf("╠══════════════════════════════════════════════════════════╣\n");
+    printf("║  %-10s %-10s %-10s %-10s %-12s  ║\n",
+           "Mode", "Time(ms)", "CPU(%)",
+           "Ctx Total", "Vol/NonVol");
+    printf("╠══════════════════════════════════════════════════════════╣\n");
+    printf("║  %-10s %-10.4f %-10.2f %-10ld %ld/%-10ld  ║\n",
+           "Thread", thread_time, thread_cpu,
+           thread_ctx_total,
+           thread_vol, thread_nonvol);
+    printf("║  %-10s %-10.4f %-10.2f %-10ld %ld/%-10ld  ║\n",
+           "Process", process_time, process_cpu,
+           process_ctx_total,
+           process_vol, process_nonvol);
+    printf("╠══════════════════════════════════════════════════════════╣\n");
+    printf("║  Time Speedup   : Thread is %.2fx faster                 ║\n",
+           speedup);
+    printf("║  Switch Ratio   : Process has %ldx more switches         ║\n",
+           ctx_ratio);
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
 
     printf("✓ Results saved to %s\n", CSV_FILE);
     printf("✓ Run: python3 visualizer.py\n\n");
